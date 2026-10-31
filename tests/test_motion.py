@@ -2,28 +2,31 @@ import numpy as np
 from PIL import Image
 
 from app.mapper import Element
-from app.motion import frame_at, prepare
+from app.motion import build_rig, fixture_colours
 from app.planner import Plan
 
 
-def setup(motion="climb"):
+def rig_and_plan(motion="climb"):
+    img = Image.new("RGB", (60, 100), "black")
     m = Image.new("L", (60, 100), 0)
     m.paste(255, (20, 10, 40, 90))  # element: x 20-40, y 10-90
     els = [Element(1, "tower", "tower", (20, 10, 40, 90), m)]
     plan = Plan.model_validate({"title": "t", "duration_s": 10, "steps": [
         {"start_s": 0, "end_s": 10, "element_ids": [1], "motion": motion, "colors": ["#FF0000"], "description": "d"}]})
-    base = np.zeros((100, 60, 3), np.float32)
-    base[::4] = 255  # horizontal stripes = edges for the fixture finder
-    return base, plan, prepare(els, base)
+    return build_rig(img, els, scale=1, count=100), plan
 
 
-def test_climb_rises_and_stays_inside_the_element():
-    base, plan, prep = setup()
-    inside = prep[1].mask
-    bright = lambda t: (frame_at(base, plan, prep, t)[..., 0] > 200) & (frame_at(base, plan, prep, t)[..., 1] < 60)
-    red = [bright(t) for t in (2, 5, 8)]
-    counts = [r.sum() for r in red]
-    assert counts[0] < counts[1] < counts[2]          # more lit as the front climbs
-    assert not (red[2] & ~inside).any()               # nothing lit outside the element
-    ys = np.where(red[0].any(axis=1))[0]
-    assert ys.min() > 50                              # early on, only the bottom is lit
+def test_fixtures_stay_inside_the_element():
+    rig, _ = rig_and_plan()
+    f = rig.fx[1]
+    assert len(f.ys) > 20
+    assert f.xs.min() >= 20 and f.xs.max() <= 40 and f.ys.min() >= 10 and f.ys.max() <= 90
+
+
+def test_climb_lights_more_fixtures_from_the_bottom_up():
+    rig, plan = rig_and_plan()
+    f = rig.fx[1]
+    on = lambda t: fixture_colours(rig, plan, t)[:, 0] > 128
+    a, b, c = on(3), on(5), on(7)
+    assert a.sum() < b.sum() < c.sum()
+    assert f.ys[a].min() > 50  # early on, only the bottom of the element is lit
