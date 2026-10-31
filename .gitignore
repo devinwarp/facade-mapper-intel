@@ -1,0 +1,7 @@
+.venv/
+__pycache__/
+.env
+.DS_Store
+out/
+# private planning docs, not part of the submission
+docs/plans/
