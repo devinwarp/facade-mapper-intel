@@ -1,9 +1,9 @@
 """Call each Meta model once to see what works from this machine/region.
 
 Run: uv run python scripts/smoke.py   (needs MODEL_API_KEY)
-The SAM request shape is a GUESS from secondary docs; check dev.meta.ai/docs/sam/segmenting.
+SAM docs: dev.meta.ai/docs/sam/segmenting
 """
-import base64, os, sys, httpx
+import base64, os, sys
 from openai import OpenAI
 
 KEY = os.environ.get("MODEL_API_KEY") or sys.exit("set MODEL_API_KEY")
@@ -35,17 +35,16 @@ def sam():
     if not img:
         return "skipped (pass a facade photo path as argv[1])"
     b64 = base64.b64encode(open(img, "rb").read()).decode()
-    r = httpx.post(
-        f"{BASE}/responses",
-        headers={"Authorization": f"Bearer {KEY}"},
-        timeout=120,
-        json={"model": "sam-3.1", "input": [{"role": "user", "content": [
-            {"type": "input_image", "image_url": f"data:image/jpeg;base64,{b64}"},
-            {"type": "input_text", "text": "vertical fins"},
-        ]}]},
-    )
-    r.raise_for_status()
-    return r.text[:300]
+    out = ""
+    # Must be a streamed Responses call; concept prompts are one short noun phrase.
+    with client.responses.stream(model="sam-3.1", input=[{"type": "message", "role": "user", "content": [
+        {"type": "input_text", "text": "sky"},
+        {"type": "input_image", "image_url": f"data:image/jpeg;base64,{b64}"},
+    ]}], metadata={"mask_encoding": "one_bit"}) as s:
+        for e in s:
+            if e.type == "response.output_text.delta":
+                out += e.delta
+    return f"{len(out)} chars of SAM tokens" if out else "completed, 0 matches"
 
 
 step("muse-spark", spark)
