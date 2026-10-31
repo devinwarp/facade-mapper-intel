@@ -4,7 +4,7 @@ import asyncio, subprocess, sys
 from dataclasses import dataclass
 
 import numpy as np
-from PIL import Image, ImageDraw, ImageFont
+from PIL import Image, ImageDraw, ImageFilter, ImageFont
 
 from app.mapper import Element
 from app.planner import Plan, Step
@@ -23,15 +23,32 @@ def _hex(c: str) -> np.ndarray:
 class Prepared:
     mask: np.ndarray  # bool HxW
     y0: int; y1: int; x0: int; x1: int  # extent of the mask itself, not the Spark box
+    light: np.ndarray  # float HxW 0..1: where fixtures + their glow can emit
 
 
-def prepare(els: list[Element]) -> dict[int, Prepared]:
+def fixtures(base: np.ndarray, mask: np.ndarray, vertical: bool, keep: float = 0.15) -> np.ndarray:
+    """Virtual linear fixtures: the element's own strongest edges across its dominant direction.
+    Light exists only on these lines (plus glow); the surface between them stays dark.
+    ponytail: stand-in for the real survey (fixture layout); swap in surveyed lines when available."""
+    g = base.mean(axis=2)
+    d = np.zeros_like(g)
+    if vertical:
+        d[:, 1:] = np.abs(g[:, 1:] - g[:, :-1])
+    else:
+        d[1:] = np.abs(g[1:] - g[:-1])
+    thr = np.quantile(d[mask], 1 - keep) if mask.any() else 1
+    line = Image.fromarray(((d >= thr) & mask).astype(np.uint8) * 255).filter(ImageFilter.MaxFilter(3))
+    glow = np.asarray(line.filter(ImageFilter.GaussianBlur(2.5)), np.float32) / 255
+    return np.clip(np.asarray(line, np.float32) / 255 + 0.7 * glow, 0, 1) * mask
+
+
+def prepare(els: list[Element], base: np.ndarray) -> dict[int, Prepared]:
     out = {}
     for e in els:
         m = np.asarray(e.mask) > 127
         ys, xs = np.where(m)
         if len(ys):
-            out[e.id] = Prepared(m, ys.min(), ys.max() + 1, xs.min(), xs.max() + 1)
+            out[e.id] = Prepared(m, ys.min(), ys.max() + 1, xs.min(), xs.max() + 1, fixtures(base, m, e.kind == "fins"))
     return out
 
 
@@ -91,8 +108,6 @@ def _text_alpha(text: str, p: Prepared, shape: tuple[int, int]) -> np.ndarray:
 def frame_at(base: np.ndarray, plan: Plan, prep: dict[int, Prepared], t: float) -> np.ndarray:
     """Composite every active step at time t over the dimmed photo."""
     out = base * DIM
-    lum = base.mean(axis=2, keepdims=True) / 255
-    tex = 0.45 + 1.1 * lum / max(float(lum.max()), 1e-3)  # keeps fins/bands visible under the colour
     for s in plan.steps:
         if not (s.start_s <= t < s.end_s):
             continue
@@ -103,8 +118,8 @@ def frame_at(base: np.ndarray, plan: Plan, prep: dict[int, Prepared], t: float) 
             if p is None:
                 continue
             a, col = lit(s, p, q, t, base.shape[:2])
-            a = (a * p.mask * env)[..., None]
-            out = out * (1 - a) + col * a * tex  # light rides the building's own lines
+            a = (a * p.light * env)[..., None]
+            out = out * (1 - a) + col * a  # light only where a fixture is
     return out
 
 
@@ -112,7 +127,7 @@ def render(img: Image.Image, els: list[Element], plan: Plan, out_path: str, fps:
     """Write an H.264 preview of the plan composited on the photo. Returns frame count."""
     w, h = img.width // 2 * 2, img.height // 2 * 2  # h264 needs even sizes
     base = np.asarray(img.convert("RGB").crop((0, 0, w, h)), np.float32)
-    prep = prepare(els)
+    prep = prepare(els, base)
     n = int(plan.duration_s * fps)
     ff = subprocess.Popen(
         ["ffmpeg", "-y", "-loglevel", "error", "-f", "rawvideo", "-pix_fmt", "rgb24", "-s", f"{w}x{h}",

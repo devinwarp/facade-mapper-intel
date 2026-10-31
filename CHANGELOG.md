@@ -14,3 +14,4 @@ Event work only (26 Oct – 4 Nov 2026). One entry per feature, dated.
 
 ## 2026-10-31 (F4)
 - F4 element-driven motion: own code, no model. Climb/descend/sweep/pulse/shimmer/fill/hold/text run inside each element mask along its own extent, lit through the photo texture. `python -m app.motion`, H.264 preview via ffmpeg.
+- F4 renders light only on linear fixtures (virtual fixtures derived from each element's edges), not as a surface wash, to match how real facades are lit.

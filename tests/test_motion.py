@@ -12,12 +12,14 @@ def setup(motion="climb"):
     els = [Element(1, "tower", "tower", (20, 10, 40, 90), m)]
     plan = Plan.model_validate({"title": "t", "duration_s": 10, "steps": [
         {"start_s": 0, "end_s": 10, "element_ids": [1], "motion": motion, "colors": ["#FF0000"], "description": "d"}]})
-    return np.full((100, 60, 3), 255, np.float32), plan, prepare(els)
+    base = np.zeros((100, 60, 3), np.float32)
+    base[::4] = 255  # horizontal stripes = edges for the fixture finder
+    return base, plan, prepare(els, base)
 
 
 def test_climb_rises_and_stays_inside_the_element():
     base, plan, prep = setup()
-    inside = np.asarray(Image.open("/dev/null") if False else prep[1].mask)
+    inside = prep[1].mask
     bright = lambda t: (frame_at(base, plan, prep, t)[..., 0] > 200) & (frame_at(base, plan, prep, t)[..., 1] < 60)
     red = [bright(t) for t in (2, 5, 8)]
     counts = [r.sum() for r in red]
