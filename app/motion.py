@@ -80,7 +80,7 @@ def _extent(mask):
     return ys.min(), ys.max() + 1, xs.min(), xs.max() + 1
 
 
-def build_rig(img: Image.Image, els: list[Element], scale: float | None = None, count: int = FIXTURES, survey=None) -> Rig:
+def build_rig(img: Image.Image, els: list[Element], scale: float | None = None, count: int = FIXTURES, survey=None, facets=None, tower=None) -> Rig:
     """Fixtures from a real survey if given (mapped onto the photo), else virtual ones placed on each element."""
     solids = [e for e in els if e.mask is not None]
     all_ys = np.where(np.any([np.asarray(e.mask) > 127 for e in solids], axis=0))[0]
@@ -92,22 +92,18 @@ def build_rig(img: Image.Image, els: list[Element], scale: float | None = None, 
     fx, idx, parts = {}, {}, []
     if survey is not None:
         from app import survey as sv
-        tower = np.zeros((H, W), bool)  # silhouette = union of the tower-like elements
-        for e in solids:
-            if e.kind in ("tower", "setback", "crown") and e.id in masks:
-                tower |= masks[e.id]
-        if not tower.any():
-            tower = max(masks.values(), key=lambda m: m.sum())
-        quad = sv.quad_from_mask(tower)
-        ys, xs = np.where(tower)
-        rects = sv.elevations(survey)
-        r = rects[sv.pick_elevation(rects, (xs.max() - xs.min()) / (ys.max() - ys.min()))]
-        X, Y = sv.map_elevation(survey, r, quad)
-        keep = tower[np.clip(Y.astype(int), 0, H - 1), np.clip(X.astype(int), 0, W - 1)]  # no light off the silhouette
-        X, Y = X[keep], Y[keep]
-        sy, sx = (quad[2, 1] - quad[0, 1]) / (r[3] - r[1]), (quad[1, 0] - quad[0, 0]) / (r[2] - r[0])
-        hh, ww = max(1, int(round(survey.h * sy))), max(1, int(round(survey.w * sx)))
-        parts.append(_splat(Y.astype(int), X.astype(int), hh, ww, 0, H, W))
+        tw = np.asarray(Image.fromarray(tower.astype(np.uint8) * 255).resize((W, H), Image.NEAREST)) > 127
+        Xs, Ys, off = [], [], 0
+        for rect, quad in facets:  # one homography per visible face (facet): canvas rect -> photo quad
+            q = np.asarray(quad, float) * scale
+            X, Y = sv.map_elevation(survey, rect, q)
+            keep = tw[np.clip(Y.astype(int), 0, H - 1), np.clip(X.astype(int), 0, W - 1)]  # no light off the silhouette
+            X, Y = X[keep], Y[keep]
+            sx = (np.hypot(*(q[1] - q[0])) + np.hypot(*(q[2] - q[3]))) / 2 / (rect[2] - rect[0])
+            sy = (np.hypot(*(q[3] - q[0])) + np.hypot(*(q[2] - q[1]))) / 2 / (rect[3] - rect[1])
+            parts.append(_splat(Y.astype(int), X.astype(int), max(1, int(round(survey.h * sy))), max(1, int(round(survey.w * sx))), off, H, W))
+            Xs.append(X); Ys.append(Y); off += len(X)
+        X, Y = np.concatenate(Xs), np.concatenate(Ys)
         for e in solids:
             if e.id in masks:
                 i = np.where(masks[e.id][np.clip(Y.astype(int), 0, H - 1), np.clip(X.astype(int), 0, W - 1)])[0]
@@ -210,9 +206,9 @@ def frame_at(rig: Rig, plan: Plan, t: float) -> np.ndarray:
     return rig.base + layer + 1.6 * glow
 
 
-def render(img: Image.Image, els: list[Element], plan: Plan, out_path: str, fps: int = 24, count: int = FIXTURES, survey=None) -> tuple[int, int]:
+def render(img: Image.Image, els: list[Element], plan: Plan, out_path: str, fps: int = 24, count: int = FIXTURES, survey=None, facets=None, tower=None) -> tuple[int, int]:
     """Write an H.264 preview. Returns (frames, fixture count)."""
-    rig = build_rig(img, els, count=count, survey=survey)
+    rig = build_rig(img, els, count=count, survey=survey, facets=facets, tower=tower)
     H, W = rig.base.shape[:2]
     ff = subprocess.Popen(
         ["ffmpeg", "-y", "-loglevel", "error", "-f", "rawvideo", "-pix_fmt", "rgb24", "-s", f"{W}x{H}",
@@ -230,16 +226,26 @@ if __name__ == "__main__":  # python -m app.motion photo.png "brief" out.mp4 [du
     from app.planner import make_plan
     im = Image.open(sys.argv[1])
     dur = float(sys.argv[4]) if len(sys.argv) > 4 else 20
-    from app.survey import load_survey
-    surv = load_survey(sys.argv[5], cache=sys.argv[5] + '.npz') if len(sys.argv) > 5 else None
-    cache = sys.argv[3] + ".pkl"  # reuse map+plan so motion can be iterated without new model calls
+    surv = None
+    if len(sys.argv) > 5:
+        from app.survey import load_survey
+        surv = load_survey(sys.argv[5], cache=sys.argv[5] + ".npz")
+    cache = sys.argv[3] + ".pkl"  # reuse map+faces+plan so motion can be iterated without new model calls
 
     async def go():
         els = await map_facade(im)
-        return els, await make_plan(im, els, sys.argv[2], dur)
+        tower = pairs = None
+        if surv is not None:
+            from app.facets import map_faces
+            from app.mapper import Element
+            tower, pairs = await map_faces(im, surv)
+            ys, xs = np.where(tower)  # the whole tower is an element too, so the plan can drive the entire facade
+            els.append(Element(max(e.id for e in els) + 1, "whole tower", "tower", (int(xs.min()), int(ys.min()), int(xs.max()), int(ys.max())),
+                               Image.fromarray(tower.astype(np.uint8) * 255)))
+        return els, await make_plan(im, els, sys.argv[2], dur), tower, pairs
 
-    els, plan = pickle.load(open(cache, "rb")) if os.path.exists(cache) else asyncio.run(go())
-    pickle.dump((els, plan), open(cache, "wb"))
+    els, plan, tower, pairs = pickle.load(open(cache, "rb")) if os.path.exists(cache) else asyncio.run(go())
+    pickle.dump((els, plan, tower, pairs), open(cache, "wb"))
     for e in els: print(e.id, e.kind, e.label)
     for st in plan.steps: print(st.start_s, st.end_s, st.element_ids, st.motion, st.colors[:2], st.text)
-    print("frames, fixtures:", render(im, els, plan, sys.argv[3], survey=surv))
+    print("frames, fixtures:", render(im, els, plan, sys.argv[3], survey=surv, facets=pairs, tower=tower))

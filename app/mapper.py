@@ -102,6 +102,38 @@ async def outline(img: Image.Image, els: list[Element]) -> list[Element]:
     return els
 
 
+async def concept_masks(img: Image.Image, text: str) -> list["np.ndarray"]:
+    """SAM 3.1 concept prompt (one short noun phrase) -> one bool mask per match, full image size."""
+    import numpy as np
+    stream = await _client().responses.create(
+        model="sam-3.1", stream=True,
+        input=[{"type": "message", "role": "user", "content": [
+            {"type": "input_text", "text": text},
+            {"type": "input_image", "image_url": _data_url(img)},
+        ]}],
+    )
+    res = await parse_responses_stream(stream, image_segmentation_format()).final_result()
+    out = []
+    for rec in res.records:
+        if type(rec).__name__ != "SegmentationMaskRecord":
+            continue
+        m = rec.mask
+        tile = np.frombuffer(decode_mask_to_raster(m), np.uint8).reshape(m.height, m.width) > 0
+        full = np.zeros((img.height, img.width), bool)
+        t, l = int(rec.bounds.top), int(rec.bounds.left)
+        full[t:t + m.height, l:l + m.width] = tile
+        out.append(full)
+    return out
+
+
+async def tower_mask(img: Image.Image) -> "np.ndarray":
+    """The main tower's silhouette: the largest 'skyscraper' match (clean of annexes, unlike element kinds)."""
+    ms = await concept_masks(img, "skyscraper")
+    if not ms:
+        raise ValueError("SAM found no skyscraper in the photo")
+    return max(ms, key=lambda m: m.sum())
+
+
 REGION_KINDS = {"band", "fins", "glass"}  # repeated detail: not a single object SAM can outline
 
 

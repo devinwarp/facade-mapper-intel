@@ -23,3 +23,10 @@ def test_quad_from_mask():
     m = np.zeros((100, 60), bool); m[10:90, 20:40] = True
     q = quad_from_mask(m)
     assert q[0].tolist() == [20, 10] and q[2].tolist() == [39, 89]
+
+
+def test_silhouette_edges_of_a_rectangle():
+    from app.facets import silhouette_edges
+    m = np.zeros((100, 60), bool); m[10:90, 20:40] = True
+    yt, yb, L, R = silhouette_edges(m)
+    assert (yt, yb) == (10, 89) and abs(L(50) - 20) < 1e-6 and abs(R(50) - 39) < 1e-6
