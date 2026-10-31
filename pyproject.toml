@@ -12,6 +12,7 @@ dependencies = [
     "pillow>=10",
     "meta-sam-parser>=0.1.0",
     "python-multipart>=0.0.32",
+    "numpy>=2.5.4",
 ]
 
 [dependency-groups]
