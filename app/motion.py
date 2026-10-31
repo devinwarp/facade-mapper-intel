@@ -62,44 +62,79 @@ def is_vertical(base: np.ndarray, mask: np.ndarray) -> bool:
 class Rig:
     base: np.ndarray            # dimmed photo, float HxWx3
     fx: dict[int, Fx]
-    slices: dict[int, slice]    # element id -> range in the flat fixture arrays
+    slices: dict[int, object]   # element id -> its fixtures (slice or index array) in the flat arrays
     py: np.ndarray; px: np.ndarray; owner: np.ndarray  # splat pixels and the fixture that owns each
     n: int
+    glow: float = GLOW
 
 
-def build_rig(img: Image.Image, els: list[Element], scale: float | None = None, count: int = FIXTURES) -> Rig:
+def _splat(cy, cx, hh, ww, off, H, W):
+    dy, dx = np.meshgrid(np.arange(hh) - hh // 2, np.arange(ww) - ww // 2, indexing="ij")
+    dy, dx = dy.ravel(), dx.ravel()
+    return (np.clip(cy[:, None] + dy[None], 0, H - 1).ravel(), np.clip(cx[:, None] + dx[None], 0, W - 1).ravel(),
+            np.repeat(np.arange(len(cy)) + off, len(dy)))
+
+
+def _extent(mask):
+    ys, xs = np.where(mask)
+    return ys.min(), ys.max() + 1, xs.min(), xs.max() + 1
+
+
+def build_rig(img: Image.Image, els: list[Element], scale: float | None = None, count: int = FIXTURES, survey=None) -> Rig:
+    """Fixtures from a real survey if given (mapped onto the photo), else virtual ones placed on each element."""
     solids = [e for e in els if e.mask is not None]
-    tallest = max(np.ptp(np.where(np.asarray(e.mask) > 127)[0]) for e in solids)
-    scale = scale or max(1.0, 1600 / tallest)  # upsample so fine fixtures are visible
+    all_ys = np.where(np.any([np.asarray(e.mask) > 127 for e in solids], axis=0))[0]
+    scale = scale or max(1.0, 1600 / np.ptp(all_ys))  # facade height -> ~1600 px  # upsample so fine fixtures are visible
     W, H = int(img.width * scale) // 2 * 2, int(img.height * scale) // 2 * 2
-    photo = img.convert("RGB").resize((W, H), Image.LANCZOS)
-    small = np.asarray(img.convert("RGB"), np.float32)
-    base = np.asarray(photo, np.float32)
-    union = np.zeros((img.height, img.width), bool)
-    for e in solids:
-        union |= np.asarray(e.mask) > 127
-    L = float(np.sqrt(union.sum() * scale**2 / (ALONG * ACROSS * count)))  # dash length that yields ~count fixtures
-    fx, slices, owner_list, py_list, px_list, off = {}, {}, [], [], [], 0
-    for e in solids:
-        m_small = np.asarray(e.mask) > 127
-        m = np.asarray(e.mask.resize((W, H), Image.NEAREST)) > 127
-        if not m.any():
-            continue
-        f, L, t = place(m, is_vertical(small, m_small), L)
-        if not len(f.ys):
-            continue
-        h, w = (L, t) if f.vertical else (t, L)
-        hh, ww = max(1, int(round(h))), max(1, int(round(w)))
-        dy, dx = np.meshgrid(np.arange(hh) - hh // 2, np.arange(ww) - ww // 2, indexing="ij")
-        dy, dx = dy.ravel(), dx.ravel()
-        cy, cx = f.ys.astype(int), f.xs.astype(int)
-        py_list.append(np.clip(cy[:, None] + dy[None], 0, H - 1).ravel())
-        px_list.append(np.clip(cx[:, None] + dx[None], 0, W - 1).ravel())
-        owner_list.append(np.repeat(np.arange(len(cy)) + off, len(dy)))
-        fx[e.id] = f
-        slices[e.id] = slice(off, off + len(cy))
-        off += len(cy)
-    return Rig(base * DIM, fx, slices, np.concatenate(py_list), np.concatenate(px_list), np.concatenate(owner_list), off)
+    base = np.asarray(img.convert("RGB").resize((W, H), Image.LANCZOS), np.float32)
+    masks = {e.id: np.asarray(e.mask.resize((W, H), Image.NEAREST)) > 127 for e in solids}
+    masks = {k: m for k, m in masks.items() if m.any()}
+    fx, idx, parts = {}, {}, []
+    if survey is not None:
+        from app import survey as sv
+        tower = np.zeros((H, W), bool)  # silhouette = union of the tower-like elements
+        for e in solids:
+            if e.kind in ("tower", "setback", "crown") and e.id in masks:
+                tower |= masks[e.id]
+        if not tower.any():
+            tower = max(masks.values(), key=lambda m: m.sum())
+        quad = sv.quad_from_mask(tower)
+        ys, xs = np.where(tower)
+        rects = sv.elevations(survey)
+        r = rects[sv.pick_elevation(rects, (xs.max() - xs.min()) / (ys.max() - ys.min()))]
+        X, Y = sv.map_elevation(survey, r, quad)
+        keep = tower[np.clip(Y.astype(int), 0, H - 1), np.clip(X.astype(int), 0, W - 1)]  # no light off the silhouette
+        X, Y = X[keep], Y[keep]
+        sy, sx = (quad[2, 1] - quad[0, 1]) / (r[3] - r[1]), (quad[1, 0] - quad[0, 0]) / (r[2] - r[0])
+        hh, ww = max(1, int(round(survey.h * sy))), max(1, int(round(survey.w * sx)))
+        parts.append(_splat(Y.astype(int), X.astype(int), hh, ww, 0, H, W))
+        for e in solids:
+            if e.id in masks:
+                i = np.where(masks[e.id][np.clip(Y.astype(int), 0, H - 1), np.clip(X.astype(int), 0, W - 1)])[0]
+                if len(i):
+                    y0, y1, x0, x1 = _extent(masks[e.id])
+                    fx[e.id], idx[e.id] = Fx(Y[i], X[i], y0, y1, x0, x1, True), i
+        n = len(Y)
+    else:
+        union = np.zeros((img.height, img.width), bool)
+        for e in solids:
+            union |= np.asarray(e.mask) > 127
+        L = float(np.sqrt(union.sum() * scale**2 / (ALONG * ACROSS * count)))  # dash length that yields ~count fixtures
+        small = np.asarray(img.convert("RGB"), np.float32)
+        off = 0
+        for e in solids:
+            if e.id not in masks:
+                continue
+            f, L, t = place(masks[e.id], is_vertical(small, np.asarray(e.mask) > 127), L)
+            if not len(f.ys):
+                continue
+            h, w = (L, t) if f.vertical else (t, L)
+            parts.append(_splat(f.ys.astype(int), f.xs.astype(int), max(1, int(round(h))), max(1, int(round(w))), off, H, W))
+            fx[e.id], idx[e.id] = f, slice(off, off + len(f.ys))
+            off += len(f.ys)
+        n = off
+    py, px, owner = (np.concatenate(c) for c in zip(*parts))
+    return Rig(base * DIM, fx, idx, py, px, owner, n, max(GLOW, scale * 0.8))
 
 
 def _stripes(axis, colors, start, extent):
@@ -171,13 +206,13 @@ def fixture_colours(rig: Rig, plan: Plan, t: float) -> np.ndarray:
 def frame_at(rig: Rig, plan: Plan, t: float) -> np.ndarray:
     layer = np.zeros_like(rig.base)
     layer[rig.py, rig.px] = fixture_colours(rig, plan, t)[rig.owner]
-    glow = np.asarray(Image.fromarray(layer.clip(0, 255).astype(np.uint8)).filter(ImageFilter.GaussianBlur(GLOW)), np.float32)
+    glow = np.asarray(Image.fromarray(layer.clip(0, 255).astype(np.uint8)).filter(ImageFilter.GaussianBlur(rig.glow)), np.float32)
     return rig.base + layer + 1.6 * glow
 
 
-def render(img: Image.Image, els: list[Element], plan: Plan, out_path: str, fps: int = 24, count: int = FIXTURES) -> tuple[int, int]:
+def render(img: Image.Image, els: list[Element], plan: Plan, out_path: str, fps: int = 24, count: int = FIXTURES, survey=None) -> tuple[int, int]:
     """Write an H.264 preview. Returns (frames, fixture count)."""
-    rig = build_rig(img, els, count=count)
+    rig = build_rig(img, els, count=count, survey=survey)
     H, W = rig.base.shape[:2]
     ff = subprocess.Popen(
         ["ffmpeg", "-y", "-loglevel", "error", "-f", "rawvideo", "-pix_fmt", "rgb24", "-s", f"{W}x{H}",
@@ -189,13 +224,14 @@ def render(img: Image.Image, els: list[Element], plan: Plan, out_path: str, fps:
     return n, rig.n
 
 
-if __name__ == "__main__":  # python -m app.motion photo.png "brief" out.mp4 [duration_s] [fixture_count]
+if __name__ == "__main__":  # python -m app.motion photo.png "brief" out.mp4 [duration_s] [survey_mask.png]
     import os, pickle
     from app.mapper import map_facade
     from app.planner import make_plan
     im = Image.open(sys.argv[1])
     dur = float(sys.argv[4]) if len(sys.argv) > 4 else 20
-    cnt = int(sys.argv[5]) if len(sys.argv) > 5 else FIXTURES
+    from app.survey import load_survey
+    surv = load_survey(sys.argv[5], cache=sys.argv[5] + '.npz') if len(sys.argv) > 5 else None
     cache = sys.argv[3] + ".pkl"  # reuse map+plan so motion can be iterated without new model calls
 
     async def go():
@@ -206,4 +242,4 @@ if __name__ == "__main__":  # python -m app.motion photo.png "brief" out.mp4 [du
     pickle.dump((els, plan), open(cache, "wb"))
     for e in els: print(e.id, e.kind, e.label)
     for st in plan.steps: print(st.start_s, st.end_s, st.element_ids, st.motion, st.colors[:2], st.text)
-    print("frames, fixtures:", render(im, els, plan, sys.argv[3], count=cnt))
+    print("frames, fixtures:", render(im, els, plan, sys.argv[3], survey=surv))

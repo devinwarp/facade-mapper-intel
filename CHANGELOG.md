@@ -16,3 +16,4 @@ Event work only (26 Oct – 4 Nov 2026). One entry per feature, dated.
 - F4 element-driven motion: own code, no model. Climb/descend/sweep/pulse/shimmer/fill/hold/text run inside each element mask along its own extent, lit through the photo texture. `python -m app.motion`, H.264 preview via ffmpeg.
 - F4 renders light only on linear fixtures (virtual fixtures derived from each element's edges), not as a surface wash, to match how real facades are lit.
 - F4 rewritten: from a photo alone, virtual fixtures are placed on every element (dash shape and spacing calibrated on a real surveyed tower: 7,140 fixtures), each fixture lit as one unit with glow. No UV map needed at runtime; the survey is only the calibration reference.
+- F4 uses a real fixture survey when given: reads every fixture from the UV mask, splits it into elevations, maps the matching elevation onto the tower silhouette (homography from the SAM mask). Without a survey it falls back to virtual fixtures.
